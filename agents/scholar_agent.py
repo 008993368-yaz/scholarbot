@@ -3,14 +3,36 @@ from typing import TypedDict, Annotated, Sequence
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.prebuilt import ToolNode
 from core.tools.library_tools import LIBRARY_TOOLS
 from agents.prompts import SCHOLAR_BOT_SYSTEM_PROMPT
 from core.utils.logging_utils import get_logger
 import operator
 
 _log = get_logger(__name__)
+
+
+def _user_facing_error(exc: Exception) -> str:
+    """Return a short, actionable message for known API errors."""
+    msg = str(exc).lower()
+    if "429" in str(exc) or "insufficient_quota" in msg or "quota" in msg:
+        return (
+            "Your OpenAI account has hit its usage or quota limit. "
+            "Check your plan and billing at https://platform.openai.com/account/billing, "
+            "or try again later if you're on a free tier."
+        )
+    if "401" in str(exc) or "invalid_api_key" in msg or "authentication" in msg:
+        return (
+            "Invalid or missing OpenAI API key. Set OPENAI_API_KEY in your .env file. "
+            "Get a key at https://platform.openai.com/api-keys."
+        )
+    if "404" in str(exc) or "model_not_found" in msg:
+        return (
+            "The selected model isn't available for your account. "
+            "Set OPENAI_MODEL in .env to a model you have access to (e.g. gpt-3.5-turbo or gpt-4o-mini)."
+        )
+    return f"Something went wrong: {exc}. Please try again or rephrase your question."
 
 
 # Define the state for our agent
@@ -32,7 +54,7 @@ class ScholarAgent:
     
     def __init__(
         self,
-        model_name: str = "gpt-4",
+        model_name: str = "gpt-4o-mini",
         temperature: float = 0.7,
         system_prompt: str = SCHOLAR_BOT_SYSTEM_PROMPT
     ):
@@ -40,7 +62,7 @@ class ScholarAgent:
         Initialize the Scholar agent.
         
         Args:
-            model_name: OpenAI model to use (gpt-4, gpt-3.5-turbo, etc.)
+            model_name: OpenAI model to use (gpt-4o-mini, gpt-4o, gpt-3.5-turbo, etc.)
             temperature: Model temperature for response generation
             system_prompt: System prompt defining agent behavior
         """
@@ -173,9 +195,8 @@ class ScholarAgent:
             return response
             
         except Exception as e:
-            error_msg = f"Error processing message: {str(e)}"
-            _log.error(error_msg)
-            return f"I apologize, but I encountered an error: {str(e)}. Please try rephrasing your question."
+            _log.exception("Error processing message")
+            return _user_facing_error(e)
     
     def stream_chat(self, user_input: str, thread_id: str = "default"):
         """
@@ -210,9 +231,8 @@ class ScholarAgent:
                             yield message.content
                         
         except Exception as e:
-            error_msg = f"Error streaming response: {str(e)}"
-            _log.error(error_msg)
-            yield f"I apologize, but I encountered an error: {str(e)}"
+            _log.exception("Error streaming response")
+            yield _user_facing_error(e)
     
     def reset_conversation(self, thread_id: str = "default"):
         """

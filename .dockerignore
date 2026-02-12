@@ -1,0 +1,27 @@
+# Environment and secrets (compose injects .env at runtime)
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+venv
+.venv
+env
+
+# Git
+.git
+.gitignore
+
+# IDE and OS
+.idea
+.vscode
+*.swp
+.DS_Store
+Thumbs.db
+
+# Docs (optional: remove if you want them in the image)
+# *.md

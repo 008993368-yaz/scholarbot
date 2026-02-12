@@ -65,7 +65,7 @@ def initialize_session_state():
         st.session_state.thread_id = str(uuid.uuid4())
     
     if "agent" not in st.session_state:
-        model_name = os.getenv("OPENAI_MODEL", "gpt-4")
+        model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         temperature = float(os.getenv("OPENAI_TEMPERATURE", "0.7"))
         
         with st.spinner("Initializing ScholarBot..."):
@@ -131,7 +131,7 @@ def main():
         
         # Model settings
         st.subheader("⚙️ Settings")
-        model = os.getenv("OPENAI_MODEL", "gpt-4")
+        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         st.info(f"**Model:** {model}")
         
         # Clear conversation button

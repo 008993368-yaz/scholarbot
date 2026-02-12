@@ -1,6 +1,6 @@
 # core/tools/library_tools.py
 from typing import Optional, Any, Dict
-from langchain.tools import tool
+from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 from core.clients.csusb_library_client import CSUSBLibraryClient
 from core.utils.logging_utils import get_logger

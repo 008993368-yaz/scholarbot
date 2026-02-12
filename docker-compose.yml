@@ -1,0 +1,14 @@
+services:
+  scholarbot:
+    build: .
+    container_name: scholarbot
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    volumes:
+      - scholarbot_data:/data
+    restart: unless-stopped
+
+volumes:
+  scholarbot_data:
