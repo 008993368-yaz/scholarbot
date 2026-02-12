@@ -65,15 +65,9 @@ def initialize_session_state():
         st.session_state.thread_id = str(uuid.uuid4())
     
     if "agent" not in st.session_state:
-        model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-        temperature = float(os.getenv("OPENAI_TEMPERATURE", "0.7"))
-        
         with st.spinner("Initializing ScholarBot..."):
             try:
-                st.session_state.agent = create_scholar_agent(
-                    model_name=model_name,
-                    temperature=temperature
-                )
+                st.session_state.agent = create_scholar_agent()
                 _log.info("Agent initialized successfully")
             except Exception as e:
                 st.error(f"Failed to initialize agent: {e}")
@@ -131,8 +125,9 @@ def main():
         
         # Model settings
         st.subheader("⚙️ Settings")
-        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-        st.info(f"**Model:** {model}")
+        provider = (os.getenv("LLM_PROVIDER") or "groq").lower()
+        model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant") if provider == "groq" else os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        st.info(f"**Provider:** {provider.title()}\n**Model:** {model}")
         
         # Clear conversation button
         if st.button("🗑️ Clear Conversation", use_container_width=True):
@@ -199,9 +194,13 @@ def main():
 
 
 if __name__ == "__main__":
-    # Check for OpenAI API key
-    if not os.getenv("OPENAI_API_KEY"):
-        st.error("⚠️ OPENAI_API_KEY not found in environment variables. Please set it in your .env file.")
-        st.stop()
-    
+    provider = (os.getenv("LLM_PROVIDER") or "groq").lower()
+    if provider == "groq":
+        if not os.getenv("GROQ_API_KEY"):
+            st.error("⚠️ GROQ_API_KEY not found. Set it in .env or get a key at https://console.groq.com/keys")
+            st.stop()
+    else:
+        if not os.getenv("OPENAI_API_KEY"):
+            st.error("⚠️ OPENAI_API_KEY not found. Set it in .env or get a key at https://platform.openai.com/api-keys")
+            st.stop()
     main()

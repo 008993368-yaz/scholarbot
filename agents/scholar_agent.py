@@ -1,6 +1,7 @@
 # agents/scholar_agent.py
+import os
 from typing import TypedDict, Annotated, Sequence
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -10,27 +11,32 @@ from agents.prompts import SCHOLAR_BOT_SYSTEM_PROMPT
 from core.utils.logging_utils import get_logger
 import operator
 
+try:
+    from langchain_groq import ChatGroq
+except ImportError:
+    ChatGroq = None
+
 _log = get_logger(__name__)
 
 
 def _user_facing_error(exc: Exception) -> str:
     """Return a short, actionable message for known API errors."""
     msg = str(exc).lower()
-    if "429" in str(exc) or "insufficient_quota" in msg or "quota" in msg:
+    if "429" in str(exc) or "insufficient_quota" in msg or "quota" in msg or "rate_limit" in msg:
         return (
-            "Your OpenAI account has hit its usage or quota limit. "
-            "Check your plan and billing at https://platform.openai.com/account/billing, "
-            "or try again later if you're on a free tier."
+            "Usage or rate limit reached. Check your provider's billing/limits "
+            "(Groq: https://console.groq.com  or OpenAI: https://platform.openai.com/account/billing) "
+            "or try again later."
         )
     if "401" in str(exc) or "invalid_api_key" in msg or "authentication" in msg:
         return (
-            "Invalid or missing OpenAI API key. Set OPENAI_API_KEY in your .env file. "
-            "Get a key at https://platform.openai.com/api-keys."
+            "Invalid or missing API key. Set GROQ_API_KEY (for Groq) or OPENAI_API_KEY (for OpenAI) in your .env file. "
+            "Groq: https://console.groq.com/keys  |  OpenAI: https://platform.openai.com/api-keys"
         )
     if "404" in str(exc) or "model_not_found" in msg:
         return (
-            "The selected model isn't available for your account. "
-            "Set OPENAI_MODEL in .env to a model you have access to (e.g. gpt-3.5-turbo or gpt-4o-mini)."
+            "The selected model isn't available. Set GROQ_MODEL (e.g. llama-3.1-8b-instant) or "
+            "OPENAI_MODEL (e.g. gpt-4o-mini) in .env depending on your provider."
         )
     return f"Something went wrong: {exc}. Please try again or rephrase your question."
 
@@ -54,26 +60,44 @@ class ScholarAgent:
     
     def __init__(
         self,
-        model_name: str = "gpt-4o-mini",
+        model_name: str | None = None,
         temperature: float = 0.7,
-        system_prompt: str = SCHOLAR_BOT_SYSTEM_PROMPT
+        system_prompt: str = SCHOLAR_BOT_SYSTEM_PROMPT,
+        provider: str | None = None,
     ):
         """
         Initialize the Scholar agent.
-        
+
         Args:
-            model_name: OpenAI model to use (gpt-4o-mini, gpt-4o, gpt-3.5-turbo, etc.)
+            model_name: Model to use (e.g. llama-3.1-8b-instant for Groq, gpt-4o-mini for OpenAI).
+                        Defaults from GROQ_MODEL or OPENAI_MODEL per provider.
             temperature: Model temperature for response generation
             system_prompt: System prompt defining agent behavior
+            provider: "groq" or "openai". Defaults to env LLM_PROVIDER, then "groq".
         """
-        _log.info(f"Initializing ScholarAgent with model: {model_name}")
-        
-        # Initialize the LLM with tools
-        self.llm = ChatOpenAI(
-            model=model_name,
-            temperature=temperature,
-            streaming=True
-        ).bind_tools(LIBRARY_TOOLS)
+        provider = (provider or os.getenv("LLM_PROVIDER", "groq")).lower()
+        if model_name is None:
+            model_name = (
+                os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+                if provider == "groq"
+                else os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+            )
+        _log.info(f"Initializing ScholarAgent with provider={provider}, model={model_name}")
+
+        if provider == "groq":
+            if ChatGroq is None:
+                raise ImportError("Groq provider requested but langchain-groq is not installed. Run: pip install langchain-groq")
+            self.llm = ChatGroq(
+                model=model_name,
+                temperature=temperature,
+                streaming=True,
+            ).bind_tools(LIBRARY_TOOLS)
+        else:
+            self.llm = ChatOpenAI(
+                model=model_name,
+                temperature=temperature,
+                streaming=True,
+            ).bind_tools(LIBRARY_TOOLS)
         
         self.system_prompt = system_prompt
         
@@ -182,15 +206,25 @@ class ScholarAgent:
             
             # Invoke the agent
             result = self.app.invoke(input_state, config)
-            
-            # Extract the final message
-            final_message = result["messages"][-1]
-            
+            messages = result["messages"]
+
+            # Include any tool results from this turn so the user always sees search results
+            # (the LLM sometimes replies with only a follow-up question and omits the results)
+            last_human_idx = next((i for i in range(len(messages) - 1, -1, -1) if isinstance(messages[i], HumanMessage)), None)
+            tool_parts = []
+            if last_human_idx is not None:
+                for m in messages[last_human_idx + 1 :]:
+                    if isinstance(m, ToolMessage) and getattr(m, "content", None):
+                        tool_parts.append(m.content)
+
+            final_message = messages[-1]
             if isinstance(final_message, AIMessage):
-                response = final_message.content
+                response = (final_message.content or "").strip()
             else:
-                response = str(final_message)
-            
+                response = str(final_message).strip()
+
+            if tool_parts:
+                response = "\n\n".join(tool_parts) + ("\n\n---\n\n" + response if response else "")
             _log.info(f"Agent response: {response[:100]}...")
             return response
             
@@ -249,17 +283,21 @@ class ScholarAgent:
 
 # Factory function for easy instantiation
 def create_scholar_agent(
-    model_name: str = "gpt-4",
-    temperature: float = 0.7
+    model_name: str | None = None,
+    temperature: float | None = None,
+    provider: str | None = None,
 ) -> ScholarAgent:
     """
     Create a ScholarAgent instance.
-    
+
     Args:
-        model_name: OpenAI model to use
-        temperature: Model temperature
-        
+        model_name: Override model (defaults from GROQ_MODEL or OPENAI_MODEL per provider).
+        temperature: Model temperature (defaults from OPENAI_TEMPERATURE or 0.7).
+        provider: "groq" or "openai" (defaults from LLM_PROVIDER env, then "groq").
+
     Returns:
         Initialized ScholarAgent
     """
-    return ScholarAgent(model_name=model_name, temperature=temperature)
+    if temperature is None:
+        temperature = float(os.getenv("OPENAI_TEMPERATURE", "0.7"))
+    return ScholarAgent(model_name=model_name, temperature=temperature, provider=provider)
