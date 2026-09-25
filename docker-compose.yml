@@ -6,6 +6,8 @@ services:
       - "8501:8501"
     env_file:
       - .env
+    environment:
+      - DATA_DIR=/data
     volumes:
       - scholarbot_data:/data
     restart: unless-stopped
