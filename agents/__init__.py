@@ -1,2 +1,6 @@
 # agents/__init__.py
-"""Agents for ScholarBot."""
+"""ScholarBot conversational agents."""
+
+from agents.scholar_agent import ScholarAgent, create_scholar_agent, ChatReply
+
+__all__ = ["ScholarAgent", "create_scholar_agent", "ChatReply"]

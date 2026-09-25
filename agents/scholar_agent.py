@@ -1,303 +1,439 @@
 # agents/scholar_agent.py
-import os
-from typing import TypedDict, Annotated, Sequence
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
-from langchain_openai import ChatOpenAI
-from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.prebuilt import ToolNode
-from core.tools.library_tools import LIBRARY_TOOLS
-from agents.prompts import SCHOLAR_BOT_SYSTEM_PROMPT
-from core.utils.logging_utils import get_logger
-import operator
+"""LangGraph ScholarBot agent with Jev routing and OpenRouter chat."""
+from __future__ import annotations
 
-try:
-    from langchain_groq import ChatGroq
-except ImportError:
-    ChatGroq = None
+import os
+import operator
+from dataclasses import dataclass, field
+from typing import Annotated, Any, Literal, Optional, Sequence, TypedDict
+
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
+from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, StateGraph
+
+from agents.prompts import (
+    CHITCHAT_SYSTEM_PROMPT,
+    CLARIFY_SYSTEM_PROMPT,
+    EXTRACT_SYSTEM_PROMPT,
+    PRESENT_SYSTEM_PROMPT,
+)
+from core.clients.jev_client import JevClient
+from core.tools.library_tools import LIBRARY_TOOLS, run_library_search
+from core.utils.logging_utils import get_logger
 
 _log = get_logger(__name__)
 
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+# Free Llama 3.3 was removed from OpenRouter; use a free model that supports tools.
+DEFAULT_CHAT_MODEL = "nex-agi/nex-n2.5-pro:free"
+# Tried in order when the primary model is down / rate-limited (OpenRouter: max 3).
+DEFAULT_FALLBACK_MODELS = [
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "qwen/qwen3.8-27b:free",
+    "openrouter/free",
+]
+
+
+@dataclass
+class ChatReply:
+    """Assistant response returned to the Streamlit UI."""
+
+    text: str
+    results: list[dict[str, Any]] = field(default_factory=list)
+    total: int = 0
+
+
+class AgentState(TypedDict):
+    """LangGraph state for ScholarBot."""
+
+    messages: Annotated[Sequence[BaseMessage], operator.add]
+    route: str
+    last_topic: str
+    search_results: list
+    search_total: int
+
 
 def _user_facing_error(exc: Exception) -> str:
-    """Return a short, actionable message for known API errors."""
-    msg = str(exc).lower()
-    if "429" in str(exc) or "insufficient_quota" in msg or "quota" in msg or "rate_limit" in msg:
+    text = str(exc)
+    msg = text.lower()
+    if "429" in text or "rate-limited" in msg or "rate limit" in msg or "quota" in msg:
         return (
-            "Usage or rate limit reached. Check your provider's billing/limits "
-            "(Groq: https://console.groq.com  or OpenAI: https://platform.openai.com/account/billing) "
-            "or try again later."
+            "OpenRouter rate or usage limit reached. Wait a moment and try again, "
+            "or check https://openrouter.ai/settings/keys"
         )
-    if "401" in str(exc) or "invalid_api_key" in msg or "authentication" in msg:
+    if "401" in text or "403" in text or "invalid_api_key" in msg or "authentication" in msg:
         return (
-            "Invalid or missing API key. Set GROQ_API_KEY (for Groq) or OPENAI_API_KEY (for OpenAI) in your .env file. "
-            "Groq: https://console.groq.com/keys  |  OpenAI: https://platform.openai.com/api-keys"
+            "Invalid or missing OPENROUTER_API_KEY. Set it in your .env file: "
+            "https://openrouter.ai/settings/keys"
         )
-    if "404" in str(exc) or "model_not_found" in msg:
+    if "404" in text or "model is unavailable" in msg or "model_not_found" in msg:
         return (
-            "The selected model isn't available. Set GROQ_MODEL (e.g. llama-3.1-8b-instant) or "
-            "OPENAI_MODEL (e.g. gpt-4o-mini) in .env depending on your provider."
+            "The selected OpenRouter model is unavailable. "
+            f"Set OPENROUTER_MODEL in .env (e.g. {DEFAULT_CHAT_MODEL})."
+        )
+    if "tool use" in msg or "tool_use" in msg:
+        return (
+            "That OpenRouter model does not support tool calling. "
+            f"Set OPENROUTER_MODEL to a tool-capable free model (e.g. {DEFAULT_CHAT_MODEL})."
         )
     return f"Something went wrong: {exc}. Please try again or rephrase your question."
 
 
-# Define the state for our agent
-class AgentState(TypedDict):
-    """State for the Scholar agent."""
-    messages: Annotated[Sequence[BaseMessage], operator.add]
+def _fallback_models(primary: str) -> list[str]:
+    """Build OpenRouter fallback list (max 3), excluding the primary model."""
+    raw = os.getenv("OPENROUTER_FALLBACK_MODELS", "")
+    if raw.strip():
+        candidates = [m.strip() for m in raw.split(",") if m.strip()]
+    else:
+        candidates = list(DEFAULT_FALLBACK_MODELS)
+    return [m for m in candidates if m != primary][:3]
+
+
+def _latest_human_text(messages: Sequence[BaseMessage]) -> str:
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage):
+            return m.content if isinstance(m.content, str) else str(m.content)
+    return ""
+
+
+def _recent_turn_summaries(messages: Sequence[BaseMessage], limit: int = 6) -> list[str]:
+    turns: list[str] = []
+    for m in messages:
+        if isinstance(m, HumanMessage):
+            text = m.content if isinstance(m.content, str) else str(m.content)
+            turns.append(f"user: {text[:300]}")
+        elif isinstance(m, AIMessage) and m.content and not getattr(m, "tool_calls", None):
+            text = m.content if isinstance(m.content, str) else str(m.content)
+            turns.append(f"assistant: {text[:300]}")
+    return turns[-limit:]
+
+
+def _infer_topic_from_tool_calls(messages: Sequence[BaseMessage]) -> Optional[str]:
+    for m in reversed(messages):
+        if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
+            for tc in m.tool_calls:
+                args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", {})
+                if isinstance(args, dict) and args.get("query"):
+                    return str(args["query"])
+    return None
+
+
+def _tool_call_id(tc: Any) -> str:
+    if isinstance(tc, dict):
+        return str(tc.get("id") or "")
+    return str(getattr(tc, "id", "") or "")
+
+
+def _tool_call_args(tc: Any) -> dict:
+    if isinstance(tc, dict):
+        args = tc.get("args") or {}
+    else:
+        args = getattr(tc, "args", None) or {}
+    return args if isinstance(args, dict) else {}
 
 
 class ScholarAgent:
-    """
-    LangGraph-based conversational agent for library search.
-    
-    Features:
-    - Stateful conversations with context retention
-    - Natural language parameter extraction
-    - Intelligent tool calling for library searches
-    - Multi-turn dialogue support
-    """
-    
+    """Conversational library search agent (Jev route + OpenRouter LLM + Primo tool)."""
+
     def __init__(
         self,
-        model_name: str | None = None,
-        temperature: float = 0.7,
-        system_prompt: str = SCHOLAR_BOT_SYSTEM_PROMPT,
-        provider: str | None = None,
+        model_name: Optional[str] = None,
+        temperature: float = 0.3,
+        api_key: Optional[str] = None,
     ):
-        """
-        Initialize the Scholar agent.
-
-        Args:
-            model_name: Model to use (e.g. llama-3.1-8b-instant for Groq, gpt-4o-mini for OpenAI).
-                        Defaults from GROQ_MODEL or OPENAI_MODEL per provider.
-            temperature: Model temperature for response generation
-            system_prompt: System prompt defining agent behavior
-            provider: "groq" or "openai". Defaults to env LLM_PROVIDER, then "groq".
-        """
-        provider = (provider or os.getenv("LLM_PROVIDER", "groq")).lower()
-        if model_name is None:
-            model_name = (
-                os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
-                if provider == "groq"
-                else os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        api_key = api_key or os.getenv("OPENROUTER_API_KEY", "")
+        if not api_key:
+            raise ValueError(
+                "OPENROUTER_API_KEY is required. "
+                "Set it in your .env file (https://openrouter.ai/settings/keys)."
             )
-        _log.info(f"Initializing ScholarAgent with provider={provider}, model={model_name}")
 
-        if provider == "groq":
-            if ChatGroq is None:
-                raise ImportError("Groq provider requested but langchain-groq is not installed. Run: pip install langchain-groq")
-            self.llm = ChatGroq(
-                model=model_name,
-                temperature=temperature,
-                streaming=True,
-            ).bind_tools(LIBRARY_TOOLS)
-        else:
-            self.llm = ChatOpenAI(
-                model=model_name,
-                temperature=temperature,
-                streaming=True,
-            ).bind_tools(LIBRARY_TOOLS)
-        
-        self.system_prompt = system_prompt
-        
-        # Create the graph
-        self.graph = self._create_graph()
-        
-        # Initialize memory for stateful conversations
-        self.memory = MemorySaver()
-        
-        # Compile the graph with memory
-        self.app = self.graph.compile(checkpointer=self.memory)
-        
-        _log.info("ScholarAgent initialized successfully")
-    
-    def _create_graph(self) -> StateGraph:
-        """Create the LangGraph workflow."""
-        # Create the graph
-        workflow = StateGraph(AgentState)
-        
-        # Add nodes
-        workflow.add_node("agent", self._call_model)
-        workflow.add_node("tools", ToolNode(LIBRARY_TOOLS))
-        
-        # Define the flow
-        workflow.set_entry_point("agent")
-        
-        # Add conditional edges
-        workflow.add_conditional_edges(
-            "agent",
-            self._should_continue,
-            {
-                "continue": "tools",
-                "end": END
-            }
+        model_name = model_name or os.getenv("OPENROUTER_MODEL", DEFAULT_CHAT_MODEL)
+        fallbacks = _fallback_models(model_name)
+        _log.info(
+            "Initializing ScholarAgent with OpenRouter model=%s fallbacks=%s",
+            model_name,
+            fallbacks,
         )
-        
-        # After tools, go back to agent
-        workflow.add_edge("tools", "agent")
-        
+
+        self.jev = JevClient(api_key=api_key)
+        llm_kwargs: dict = {
+            "base_url": OPENROUTER_BASE_URL,
+            "api_key": api_key,
+            "model": model_name,
+            "temperature": temperature,
+            "default_headers": {
+                "HTTP-Referer": "https://github.com/scholarbot",
+                "X-Title": "ScholarBot",
+            },
+        }
+        if fallbacks:
+            # OpenRouter tries these slugs if the primary model fails
+            llm_kwargs["extra_body"] = {"models": fallbacks}
+        base_llm = ChatOpenAI(**llm_kwargs)
+        self.llm = base_llm
+        self.llm_with_tools = base_llm.bind_tools(LIBRARY_TOOLS)
+        self.memory = MemorySaver()
+        self.graph = self._create_graph()
+        self.app = self.graph.compile(checkpointer=self.memory)
+        _log.info("ScholarAgent initialized successfully")
+
+    def _create_graph(self) -> StateGraph:
+        workflow = StateGraph(AgentState)
+
+        workflow.add_node("route", self._route_node)
+        workflow.add_node("clarify", self._clarify_node)
+        workflow.add_node("extract", self._extract_node)
+        workflow.add_node("tools", self._tools_node)
+        workflow.add_node("present", self._present_node)
+        workflow.add_node("chitchat", self._chitchat_node)
+
+        workflow.set_entry_point("route")
+        workflow.add_conditional_edges(
+            "route",
+            self._after_route,
+            {
+                "clarify": "clarify",
+                "search": "extract",
+                "chitchat": "chitchat",
+            },
+        )
+        workflow.add_edge("clarify", END)
+        workflow.add_edge("chitchat", END)
+        workflow.add_conditional_edges(
+            "extract",
+            self._after_extract,
+            {
+                "tools": "tools",
+                "end": END,
+            },
+        )
+        workflow.add_edge("tools", "present")
+        workflow.add_edge("present", END)
+
         return workflow
-    
-    def _call_model(self, state: AgentState) -> AgentState:
-        """
-        Call the LLM with the current state.
-        
-        Args:
-            state: Current agent state with messages
-            
-        Returns:
-            Updated state with new message
-        """
-        messages = state["messages"]
-        
-        # Add system prompt if this is the start
-        if not any(isinstance(m, SystemMessage) for m in messages):
-            messages = [SystemMessage(content=self.system_prompt)] + list(messages)
-        
-        _log.info(f"Calling LLM with {len(messages)} messages")
+
+    def _route_node(self, state: AgentState) -> dict:
+        messages = list(state["messages"])
+        user_message = _latest_human_text(messages)
+        last_topic = state.get("last_topic") or _infer_topic_from_tool_calls(messages) or ""
+        recent = _recent_turn_summaries(messages)
+        path = self.jev.route_turn(user_message, recent, last_topic or None)
+        _log.info("Jev route=%s for message=%r", path, user_message[:80])
+        # Clear prior-turn table so UI only shows this turn's results
+        return {
+            "route": path,
+            "last_topic": last_topic,
+            "search_results": [],
+            "search_total": 0,
+        }
+
+    def _after_route(self, state: AgentState) -> Literal["clarify", "search", "chitchat"]:
+        route = state.get("route") or "chitchat"
+        if route == "clarify":
+            return "clarify"
+        if route == "search":
+            return "search"
+        return "chitchat"
+
+    def _clarify_node(self, state: AgentState) -> dict:
+        messages = [SystemMessage(content=CLARIFY_SYSTEM_PROMPT)] + list(state["messages"])
         response = self.llm.invoke(messages)
-        
         return {"messages": [response]}
-    
-    def _should_continue(self, state: AgentState) -> str:
-        """
-        Determine if we should call tools or end.
-        
-        Args:
-            state: Current agent state
-            
-        Returns:
-            "continue" to call tools, "end" to finish
-        """
-        messages = state["messages"]
-        last_message = messages[-1]
-        
-        # If there are tool calls, continue
-        if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-            _log.info(f"Tool calls detected: {len(last_message.tool_calls)}")
-            return "continue"
-        
-        # Otherwise end
-        _log.info("No tool calls, ending")
+
+    def _chitchat_node(self, state: AgentState) -> dict:
+        messages = [SystemMessage(content=CHITCHAT_SYSTEM_PROMPT)] + list(state["messages"])
+        response = self.llm.invoke(messages)
+        return {"messages": [response]}
+
+    def _extract_node(self, state: AgentState) -> dict:
+        messages = [SystemMessage(content=EXTRACT_SYSTEM_PROMPT)] + list(state["messages"])
+        response = self.llm_with_tools.invoke(messages)
+        updates: dict = {"messages": [response]}
+        topic = _infer_topic_from_tool_calls([response])
+        if topic:
+            updates["last_topic"] = topic
+        return updates
+
+    def _after_extract(self, state: AgentState) -> Literal["tools", "end"]:
+        last = state["messages"][-1]
+        if hasattr(last, "tool_calls") and last.tool_calls:
+            return "tools"
         return "end"
-    
-    def chat(self, user_input: str, thread_id: str = "default") -> str:
-        """
-        Process a user message and return the agent's response.
-        
-        Args:
-            user_input: User's message
-            thread_id: Thread ID for conversation tracking (enables stateful conversations)
-            
-        Returns:
-            Agent's response text
-        """
-        _log.info(f"Processing user input (thread: {thread_id}): {user_input[:100]}...")
-        
+
+    def _tools_node(self, state: AgentState) -> dict:
+        """Run library search, keep structured rows for the UI, text for the LLM."""
+        last = state["messages"][-1]
+        tool_calls = getattr(last, "tool_calls", None) or []
+        tool_messages: list[ToolMessage] = []
+        rows: list[dict] = []
+        total = 0
+
+        for tc in tool_calls:
+            args = _tool_call_args(tc)
+            call_id = _tool_call_id(tc)
+            try:
+                payload = run_library_search(
+                    query=str(args.get("query") or ""),
+                    resource_type=args.get("resource_type"),
+                    date_from=args.get("date_from"),
+                    date_to=args.get("date_to"),
+                    limit=int(args.get("limit") or 10),
+                )
+                tool_messages.append(
+                    ToolMessage(content=payload["text"], tool_call_id=call_id)
+                )
+                rows = payload.get("rows") or []
+                total = int(payload.get("total") or 0)
+            except Exception as e:
+                _log.exception("Library tool failed")
+                tool_messages.append(
+                    ToolMessage(content=f"Error searching library: {e}", tool_call_id=call_id)
+                )
+
+        return {
+            "messages": tool_messages,
+            "search_results": rows,
+            "search_total": total,
+        }
+
+    def _present_node(self, state: AgentState) -> dict:
+        messages = [SystemMessage(content=PRESENT_SYSTEM_PROMPT)] + list(state["messages"])
+        response = self.llm.invoke(messages)
+        return {"messages": [response]}
+
+    def _prepare_input(
+        self, user_input: str, thread_id: str
+    ) -> tuple[dict, dict]:
+        """Build graph input state and config for a turn."""
+        config = {"configurable": {"thread_id": thread_id}}
+        input_state: dict = {
+            "messages": [HumanMessage(content=user_input)],
+            "route": "",
+            "search_results": [],
+            "search_total": 0,
+        }
         try:
-            # Create the input state
-            input_state = {
-                "messages": [HumanMessage(content=user_input)]
-            }
-            
-            # Configure with thread ID for memory
-            config = {"configurable": {"thread_id": thread_id}}
-            
-            # Invoke the agent
-            result = self.app.invoke(input_state, config)
-            messages = result["messages"]
+            snapshot = self.app.get_state(config)
+            if snapshot and snapshot.values:
+                prior_topic = snapshot.values.get("last_topic") or ""
+                if prior_topic:
+                    input_state["last_topic"] = prior_topic
+        except Exception:
+            _log.debug("No prior state for thread %s", thread_id)
+        return input_state, config
 
-            # Include any tool results from this turn so the user always sees search results
-            # (the LLM sometimes replies with only a follow-up question and omits the results)
-            last_human_idx = next((i for i in range(len(messages) - 1, -1, -1) if isinstance(messages[i], HumanMessage)), None)
-            tool_parts = []
-            if last_human_idx is not None:
-                for m in messages[last_human_idx + 1 :]:
-                    if isinstance(m, ToolMessage) and getattr(m, "content", None):
-                        tool_parts.append(m.content)
-
-            final_message = messages[-1]
-            if isinstance(final_message, AIMessage):
-                response = (final_message.content or "").strip()
+    @staticmethod
+    def _reply_from_state(result: dict) -> ChatReply:
+        messages = result.get("messages") or []
+        response = ""
+        if messages:
+            final = messages[-1]
+            if isinstance(final, AIMessage):
+                response = (final.content or "").strip()
             else:
-                response = str(final_message).strip()
+                response = str(final).strip()
 
-            if tool_parts:
-                response = "\n\n".join(tool_parts) + ("\n\n---\n\n" + response if response else "")
-            _log.info(f"Agent response: {response[:100]}...")
-            return response
-            
+        rows = list(result.get("search_results") or [])
+        total = int(result.get("search_total") or 0)
+        if not response and rows:
+            response = f"Found {total} resources (showing {len(rows)})."
+        return ChatReply(text=response, results=rows, total=total)
+
+    # Human-readable labels for Streamlit progress UI
+    NODE_STATUS: dict[str, str] = {
+        "route": "Deciding how to handle your request…",
+        "extract": "Extracting search parameters…",
+        "tools": "Searching the CSUSB library…",
+        "present": "Summarizing results…",
+        "clarify": "Preparing a clarifying question…",
+        "chitchat": "Writing a reply…",
+    }
+
+    def chat_events(self, user_input: str, thread_id: str = "default"):
+        """
+        Stream progress events, then a final ChatReply.
+
+        Yields:
+            ("status", label: str) while nodes run
+            ("done", ChatReply) when finished
+            ("error", ChatReply) on failure
+        """
+        _log.info("Processing user input (thread: %s): %s...", thread_id, user_input[:100])
+        try:
+            input_state, config = self._prepare_input(user_input, thread_id)
+            merged: dict = dict(input_state)
+            yield ("status", "Starting…")
+
+            for chunk in self.app.stream(input_state, config, stream_mode="updates"):
+                if not isinstance(chunk, dict):
+                    continue
+                for node_name, update in chunk.items():
+                    if isinstance(update, dict):
+                        for key, value in update.items():
+                            if key == "messages":
+                                prev = list(merged.get("messages") or [])
+                                merged["messages"] = prev + list(value)
+                            else:
+                                merged[key] = value
+
+                    if node_name == "route":
+                        route = (update or {}).get("route") if isinstance(update, dict) else None
+                        if route == "search":
+                            yield ("status", "Routing complete → library search")
+                            yield ("status", "Extracting search parameters…")
+                        elif route == "clarify":
+                            yield ("status", "Routing complete → clarifying question")
+                            yield ("status", "Drafting a clarifying question…")
+                        else:
+                            yield ("status", "Routing complete → general reply")
+                            yield ("status", "Writing a reply…")
+                    elif node_name == "extract":
+                        yield ("status", "Search parameters ready")
+                        yield ("status", "Searching the CSUSB library…")
+                    elif node_name == "tools":
+                        rows = (update or {}).get("search_results") or [] if isinstance(update, dict) else []
+                        total = (update or {}).get("search_total") if isinstance(update, dict) else None
+                        if rows:
+                            yield (
+                                "status",
+                                f"Library search done — {total} found (showing {len(rows)})",
+                            )
+                        else:
+                            yield ("status", "Library search done — no matching resources")
+                        yield ("status", "Summarizing results…")
+                    elif node_name == "present":
+                        yield ("status", "Summary ready")
+                    elif node_name == "clarify":
+                        yield ("status", "Clarifying question ready")
+                    elif node_name == "chitchat":
+                        yield ("status", "Reply ready")
+                    else:
+                        yield ("status", self.NODE_STATUS.get(node_name, f"Working ({node_name})…"))
+
+            reply = self._reply_from_state(merged)
+            _log.info("Agent response: %s...", reply.text[:100])
+            yield ("done", reply)
         except Exception as e:
             _log.exception("Error processing message")
-            return _user_facing_error(e)
-    
-    def stream_chat(self, user_input: str, thread_id: str = "default"):
-        """
-        Stream the agent's response token by token.
-        
-        Args:
-            user_input: User's message
-            thread_id: Thread ID for conversation tracking
-            
-        Yields:
-            Response tokens as they're generated
-        """
-        _log.info(f"Streaming response for input (thread: {thread_id}): {user_input[:100]}...")
-        
-        try:
-            # Create the input state
-            input_state = {
-                "messages": [HumanMessage(content=user_input)]
-            }
-            
-            # Configure with thread ID for memory
-            config = {"configurable": {"thread_id": thread_id}}
-            
-            # Stream the response
-            for chunk in self.app.stream(input_state, config):
-                # Extract messages from the chunk
-                if "agent" in chunk:
-                    messages = chunk["agent"].get("messages", [])
-                    if messages:
-                        message = messages[-1]
-                        if isinstance(message, AIMessage) and message.content:
-                            yield message.content
-                        
-        except Exception as e:
-            _log.exception("Error streaming response")
-            yield _user_facing_error(e)
-    
-    def reset_conversation(self, thread_id: str = "default"):
-        """
-        Reset the conversation history for a thread.
-        
-        Args:
-            thread_id: Thread ID to reset
-        """
-        _log.info(f"Resetting conversation for thread: {thread_id}")
-        # Note: MemorySaver doesn't have a direct clear method
-        # The conversation is effectively reset by using a new thread_id
-        pass
+            yield ("error", ChatReply(text=_user_facing_error(e)))
+
+    def chat(self, user_input: str, thread_id: str = "default") -> ChatReply:
+        """Process a user message and return text plus optional result table rows."""
+        reply = ChatReply(text="")
+        for kind, payload in self.chat_events(user_input, thread_id):
+            if kind in ("done", "error"):
+                reply = payload
+        return reply
 
 
-# Factory function for easy instantiation
-def create_scholar_agent(
-    model_name: str | None = None,
-    temperature: float | None = None,
-    provider: str | None = None,
-) -> ScholarAgent:
-    """
-    Create a ScholarAgent instance.
-
-    Args:
-        model_name: Override model (defaults from GROQ_MODEL or OPENAI_MODEL per provider).
-        temperature: Model temperature (defaults from OPENAI_TEMPERATURE or 0.7).
-        provider: "groq" or "openai" (defaults from LLM_PROVIDER env, then "groq").
-
-    Returns:
-        Initialized ScholarAgent
-    """
-    if temperature is None:
-        temperature = float(os.getenv("OPENAI_TEMPERATURE", "0.7"))
-    return ScholarAgent(model_name=model_name, temperature=temperature, provider=provider)
+def create_scholar_agent() -> ScholarAgent:
+    """Factory used by the Streamlit app."""
+    return ScholarAgent()
