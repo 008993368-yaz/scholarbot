@@ -14,6 +14,22 @@ _log = get_logger(__name__)
 DECISIONS_URL = "https://openrouter.ai/api/alpha/decisions"
 DEFAULT_JEV_MODEL = "~typesafe/jev-latest"
 HAS_TOPIC_THRESHOLD = 0.55
+OFF_TOPIC_THRESHOLD = 0.5
+
+OFF_TOPIC_KEYWORDS = (
+    "joke",
+    "python code",
+    "write code",
+    "write a function",
+    "write a program",
+    "write a script",
+    "debug",
+    "recipe",
+    "poem",
+    "song",
+    "riddle",
+    "weather",
+)
 
 ROUTE_QUESTIONS: Dict[str, Any] = {
     "action": {
@@ -33,8 +49,32 @@ ROUTE_QUESTIONS: Dict[str, Any] = {
                 "or too vague to search without asking a clarifying question."
             ),
             "chitchat": (
-                "Greetings, thanks, help about how ScholarBot works, or other "
-                "non-search conversation."
+                "Only greetings, thanks, or questions about what ScholarBot is and "
+                "how it works."
+            ),
+            "off_topic": (
+                "Any request unrelated to finding academic/library resources: jokes, "
+                "writing or debugging code, math or homework answers, general knowledge "
+                "questions, essays, advice, recipes, etc. Also choose this when the "
+                "message mixes such a request with a research intent."
+            ),
+        },
+    },
+    "off_topic": {
+        "type": "noul",
+        "instructions": (
+            "Does the latest message ask ScholarBot to do anything other than find "
+            "academic/library resources or explain how ScholarBot works?"
+        ),
+        "criteria": {
+            "true": (
+                "It asks for jokes, code, calculations, homework answers, general "
+                "knowledge, creative writing, or other non-research tasks, even if "
+                "a research request is also present."
+            ),
+            "false": (
+                "It is only a library/research search request, a refinement, a "
+                "greeting/thanks, or a question about ScholarBot."
             ),
         },
     },
@@ -107,7 +147,7 @@ class JevClient:
         last_topic: Optional[str] = None,
     ) -> str:
         """
-        Decide the graph path for this turn: search | clarify | chitchat.
+        Decide the graph path for this turn: search | clarify | chitchat | off_topic.
 
         Applies the plan's deterministic thresholds on Jev's typed answers.
         """
@@ -125,7 +165,10 @@ class JevClient:
         action_ans = answers.get("action") or {}
         action = (action_ans.get("choice") or "chitchat").lower()
         has_topic = float((answers.get("has_topic") or {}).get("noul") or 0.0)
+        off_topic = float((answers.get("off_topic") or {}).get("noul") or 0.0)
 
+        if action == "off_topic" or off_topic >= OFF_TOPIC_THRESHOLD:
+            return "off_topic"
         if action == "clarify" or (action == "search" and has_topic < HAS_TOPIC_THRESHOLD):
             return "clarify"
         if action == "search" and has_topic >= HAS_TOPIC_THRESHOLD:
@@ -138,6 +181,8 @@ class JevClient:
         text = (user_message or "").strip().lower()
         if not text:
             return "clarify"
+        if any(k in text for k in OFF_TOPIC_KEYWORDS):
+            return "off_topic"
         greetings = ("hi", "hello", "hey", "thanks", "thank you", "help", "what can you")
         if any(text.startswith(g) or text == g for g in greetings) and len(text.split()) <= 6:
             return "chitchat"

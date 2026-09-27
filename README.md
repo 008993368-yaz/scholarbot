@@ -7,7 +7,7 @@ Conversational academic research assistant for the CSUSB library. Students searc
 - **UI:** Streamlit
 - **Workflow / memory:** LangGraph + `MemorySaver` (thread ID)
 - **Chat LLM:** OpenRouter free model (default `nex-agi/nex-n2.5-pro:free`, with fallbacks)
-- **Routing decisions:** OpenRouter Decisions API + `~typesafe/jev-latest` (search vs clarify vs chitchat)
+- **Routing decisions:** OpenRouter Decisions API + `~typesafe/jev-latest` (search vs clarify vs chitchat vs off-topic guardrail)
 - **Library:** CSUSB Primo public Explore REST client
 
 ## Setup
