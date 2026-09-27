@@ -22,6 +22,7 @@ from agents.prompts import (
     CHITCHAT_SYSTEM_PROMPT,
     CLARIFY_SYSTEM_PROMPT,
     EXTRACT_SYSTEM_PROMPT,
+    OFF_TOPIC_REDIRECT,
     PRESENT_SYSTEM_PROMPT,
 )
 from core.clients.jev_client import JevClient
@@ -194,6 +195,7 @@ class ScholarAgent:
         workflow.add_node("tools", self._tools_node)
         workflow.add_node("present", self._present_node)
         workflow.add_node("chitchat", self._chitchat_node)
+        workflow.add_node("off_topic", self._off_topic_node)
 
         workflow.set_entry_point("route")
         workflow.add_conditional_edges(
@@ -203,10 +205,12 @@ class ScholarAgent:
                 "clarify": "clarify",
                 "search": "extract",
                 "chitchat": "chitchat",
+                "off_topic": "off_topic",
             },
         )
         workflow.add_edge("clarify", END)
         workflow.add_edge("chitchat", END)
+        workflow.add_edge("off_topic", END)
         workflow.add_conditional_edges(
             "extract",
             self._after_extract,
@@ -235,13 +239,16 @@ class ScholarAgent:
             "search_total": 0,
         }
 
-    def _after_route(self, state: AgentState) -> Literal["clarify", "search", "chitchat"]:
+    def _after_route(
+        self, state: AgentState
+    ) -> Literal["clarify", "search", "chitchat", "off_topic"]:
         route = state.get("route") or "chitchat"
-        if route == "clarify":
-            return "clarify"
-        if route == "search":
-            return "search"
+        if route in ("clarify", "search", "off_topic"):
+            return route
         return "chitchat"
+
+    def _off_topic_node(self, state: AgentState) -> dict:
+        return {"messages": [AIMessage(content=OFF_TOPIC_REDIRECT)]}
 
     def _clarify_node(self, state: AgentState) -> dict:
         messages = [SystemMessage(content=CLARIFY_SYSTEM_PROMPT)] + list(state["messages"])
@@ -355,6 +362,7 @@ class ScholarAgent:
         "present": "Summarizing results…",
         "clarify": "Preparing a clarifying question…",
         "chitchat": "Writing a reply…",
+        "off_topic": "Off-topic request…",
     }
 
     def chat_events(self, user_input: str, thread_id: str = "default"):
@@ -392,6 +400,8 @@ class ScholarAgent:
                         elif route == "clarify":
                             yield ("status", "Routing complete → clarifying question")
                             yield ("status", "Drafting a clarifying question…")
+                        elif route == "off_topic":
+                            yield ("status", "Routing complete → off-topic request")
                         else:
                             yield ("status", "Routing complete → general reply")
                             yield ("status", "Writing a reply…")
@@ -413,7 +423,7 @@ class ScholarAgent:
                         yield ("status", "Summary ready")
                     elif node_name == "clarify":
                         yield ("status", "Clarifying question ready")
-                    elif node_name == "chitchat":
+                    elif node_name in ("chitchat", "off_topic"):
                         yield ("status", "Reply ready")
                     else:
                         yield ("status", self.NODE_STATUS.get(node_name, f"Working ({node_name})…"))
